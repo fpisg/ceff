@@ -1,7 +1,7 @@
 import cats._
 import cats.data._
 import cats.effect._
-import cats.effect.concurrent.Semaphore
+import cats.effect.concurrent.{MVar, Semaphore}
 import cats.implicits._
 import java.io.{OutputStream, InputStream, File, FileOutputStream, FileInputStream}
 
@@ -96,16 +96,24 @@ object EchoServer extends IOApp {
   import ExitCase._
   import cats.effect.syntax.all._
 
-  def echoProtocol[F[_]:Sync](clientSock: Socket) : F[Unit] = {
+  def echoProtocol[F[_]:Sync](clientSock: Socket, stopFlag: MVar[F,Unit]) : F[Unit] = {
 
     // what just happened?
     // `loop` describes an interaction between 2 IO resources, namely the
     // "reader" and "writer".
-    def loop(reader: BufferedReader, writer: BufferedWriter) : F[Unit] = for {
-      line <- Sync[F].delay(reader.readLine())
+    def loop(reader: BufferedReader, writer: BufferedWriter, stopFlag: MVar[F, Unit]) : F[Unit] = for {
+      line <- Sync[F].delay(reader.readLine()).attempt
       _    <- line match {
-        case "" => Sync[F].unit // empty line, we're done
-        case _  => Sync[F].delay{writer.write(line); writer.newLine(); writer.flush()} >> loop(reader,writer)
+          case Right(line) => line match {
+            case "STOP" => stopFlag.put(()) // Stopping server!
+            case "" => Sync[F].unit // empty line, we're done
+            case _  => Sync[F].delay{writer.write(line); writer.newLine(); writer.flush()} >> loop(reader,writer, stopFlag)
+          }
+          case Left(e) => 
+            for {
+              isEmpty <- stopFlag.isEmpty
+              _ <- if (!isEmpty) Sync[F].unit else Sync[F].raiseError(e)
+            } yield e
       }
     } yield()
 
@@ -133,25 +141,34 @@ object EchoServer extends IOApp {
     // basically, the 2 IO monads are defined as resources and then we use them
     // by hooking in the "how" via `loop`.
     readerWriter(clientSock).use{ case (reader,writer) =>
-      loop(reader, writer)
+      loop(reader, writer, stopFlag)
     }
   }
 
 
-  def serve[F[_]:Concurrent](serverSock: ServerSocket) : F[Unit] = {
+  def serve[F[_]:Concurrent](serverSock: ServerSocket, stopFlag: MVar[F, Unit]) : F[Unit] = {
     def close(socket:Socket) : F[Unit] = Sync[F].delay(socket.close).handleErrorWith(_ => Sync[F].unit)
 
     for {
-      _ <- Sync[F].delay(serverSock.accept)
+      socket <- Sync[F].delay(serverSock.accept)
                   .bracketCase { socket => // you need to include this import : "import cats.effect.syntax.all._"
-                    echoProtocol(socket).guarantee(close(socket)).start
+                    echoProtocol(socket, stopFlag).guarantee(close(socket)).start >> Sync[F].pure(socket) // 
                   }{ (socket, exit) => exit match {
                     case Completed => Sync[F].unit
                     case Error(_) | Canceled => close(socket)
                   }}
-      _ <- serve(serverSock)
+      _ <- (stopFlag.read >> close(socket)).start
+      _ <- serve(serverSock, stopFlag)
     } yield ()
   }
+
+  def server[F[_]:Concurrent](serverSocket: ServerSocket) : F[ExitCode] =
+    for {
+      stopFlag    <- MVar[F].empty[Unit]
+      serverFiber <- serve(serverSocket, stopFlag).start // server starts on its own fiber
+      _           <- stopFlag.read
+      _           <- serverFiber.cancel.start
+    } yield ExitCode.Success
 
   def run(args: List[String]) : IO[ExitCode] = {
     def close[F[_]:Sync](socket: ServerSocket) : F[Unit] =
@@ -159,11 +176,10 @@ object EchoServer extends IOApp {
 
     IO(new ServerSocket(args.headOption.map(_.toInt).getOrElse(5432)))
       .bracket{
-        serverSocket => serve[IO](serverSocket) >> IO.pure(ExitCode.Success)
+        serverSocket => server[IO](serverSocket) >> IO.pure(ExitCode.Success)
       } {
         serverSocket => close[IO](serverSocket) >> IO(println("server finished"))
       }
   }
-
 
 }
