@@ -1,9 +1,13 @@
 import cats._
 import cats.data._
 import cats.effect._
-import cats.effect.concurrent.{MVar, Semaphore}
+import cats.effect.syntax.all._
+import cats.effect.concurrent._
 import cats.implicits._
 import java.io.{OutputStream, InputStream, File, FileOutputStream, FileInputStream}
+import scala.util._
+import java.util.concurrent.Executors
+import scala.concurrent.ExecutionContext
 
 trait IOFunctions {
 
@@ -96,6 +100,58 @@ object EchoServer extends IOApp {
   import ExitCase._
   import cats.effect.syntax.all._
 
+  def echoProtocolAsync[F[_]:Async](clientSock: Socket, stopFlag: MVar[F,Unit])(implicit clientsExecutionContext: scala.concurrent.ExecutionContext) : F[Unit] = {
+
+    def loop(reader: BufferedReader, writer: BufferedWriter, stopFlag: MVar[F, Unit]) : F[Unit] = for {
+      lineE <- Async[F].async{ (cb: Either[Throwable, Either[Throwable, String]] => Unit) => 
+                clientsExecutionContext.execute(new Runnable {
+                  override def run() : Unit = {
+                    val result = Try(reader.readLine()).toEither
+                    cb(Right(result))
+                  }
+                })}
+      _    <- lineE match {
+                case Right(line) => line match {
+                  case "STOP" => stopFlag.put(()) // Stopping server!
+                  case "" => Sync[F].unit // empty line, we're done
+                  case _  => Sync[F].delay{writer.write(line); writer.newLine(); writer.flush()} >> loop(reader,writer, stopFlag)
+                }
+                case Left(e) => 
+                  for {
+                    isEmpty <- stopFlag.isEmpty
+                    _ <- if (!isEmpty) Sync[F].unit else Sync[F].raiseError(e)
+                  } yield e
+              }
+    } yield()
+
+    // define a acquire-release for acquiring an IO-reader
+    def reader(clientSock: Socket) : Resource[F, BufferedReader] =
+      Resource.make {
+        Sync[F].delay(new BufferedReader(new InputStreamReader(clientSock.getInputStream())))
+      } { reader =>
+          Sync[F].delay(reader.close()).handleErrorWith(_ => Sync[F].unit)
+      }
+    // define a acquire-release for acquiring an IO-writer
+    def writer(clientSock: Socket) : Resource[F, BufferedWriter] =
+      Resource.make {
+        Sync[F].delay(new BufferedWriter(new PrintWriter(clientSock.getOutputStream())))
+      } { writer =>
+          Sync[F].delay(writer.close()).handleErrorWith(_ => Sync[F].unit)
+      }
+
+    def readerWriter(clientSock: Socket) : Resource[F, (BufferedReader, BufferedWriter)] =
+      for {
+        reader <- reader(clientSock)
+        writer <- writer(clientSock)
+      } yield (reader, writer)
+
+    // basically, the 2 IO monads are defined as resources and then we use them
+    // by hooking in the "how" via `loop`.
+    readerWriter(clientSock).use{ case (reader,writer) =>
+      loop(reader, writer, stopFlag)
+    }
+  }
+
   def echoProtocol[F[_]:Sync](clientSock: Socket, stopFlag: MVar[F,Unit]) : F[Unit] = {
 
     // what just happened?
@@ -146,6 +202,22 @@ object EchoServer extends IOApp {
   }
 
 
+  def serveAsync[F[_]:Concurrent](serverSock: ServerSocket, stopFlag: MVar[F, Unit])(implicit clientsExecutionContext: ExecutionContext) : F[Unit] = {
+    def close(socket:Socket) : F[Unit] = Sync[F].delay(socket.close).handleErrorWith(_ => Sync[F].unit)
+
+    for {
+      socket <- Sync[F].delay(serverSock.accept)
+                  .bracketCase { socket => // you need to include this import : "import cats.effect.syntax.all._"
+                    echoProtocolAsync(socket, stopFlag).guarantee(close(socket)).start >> Sync[F].pure(socket) // 
+                  }{ (socket, exit) => exit match {
+                    case Completed => Sync[F].unit
+                    case Error(_) | Canceled => close(socket)
+                  }}
+      _ <- (stopFlag.read >> close(socket)).start
+      _ <- serveAsync(serverSock, stopFlag)
+    } yield ()
+  }
+
   def serve[F[_]:Concurrent](serverSock: ServerSocket, stopFlag: MVar[F, Unit]) : F[Unit] = {
     def close(socket:Socket) : F[Unit] = Sync[F].delay(socket.close).handleErrorWith(_ => Sync[F].unit)
 
@@ -162,6 +234,18 @@ object EchoServer extends IOApp {
     } yield ()
   }
 
+  def serverAsync[F[_]:Concurrent](serverSocket: ServerSocket) : F[ExitCode] = {
+    val clientsThreadPool = Executors.newCachedThreadPool()
+    implicit val clientsExecutionContext = ExecutionContext.fromExecutor(clientsThreadPool)
+
+    for {
+      stopFlag    <- MVar[F].empty[Unit]
+      serverFiber <- serveAsync(serverSocket, stopFlag).start // server starts on its own fiber
+      _           <- stopFlag.read
+      _           <- serverFiber.cancel.start
+    } yield ExitCode.Success
+  }
+
   def server[F[_]:Concurrent](serverSocket: ServerSocket) : F[ExitCode] =
     for {
       stopFlag    <- MVar[F].empty[Unit]
@@ -174,12 +258,21 @@ object EchoServer extends IOApp {
     def close[F[_]:Sync](socket: ServerSocket) : F[Unit] =
       Sync[F].delay(socket.close).handleErrorWith(_ => Sync[F].unit)
 
-    IO(new ServerSocket(args.headOption.map(_.toInt).getOrElse(5432)))
-      .bracket{
-        serverSocket => server[IO](serverSocket) >> IO.pure(ExitCode.Success)
-      } {
-        serverSocket => close[IO](serverSocket) >> IO(println("server finished"))
-      }
+    if (args.head.equalsIgnoreCase("sync"))
+        IO(new ServerSocket(args.headOption.map(_.toInt).getOrElse(5432)))
+          .bracket{
+            serverSocket => server[IO](serverSocket) >> IO.pure(ExitCode.Success)
+          } {
+            serverSocket => close[IO](serverSocket) >> IO(println("server finished"))
+          }
+    else
+        IO(new ServerSocket(args.tail.headOption.map(_.toInt).getOrElse(5432)))
+          .bracket{
+            serverSocket => serverAsync[IO](serverSocket) >> IO.pure(ExitCode.Success)
+          } {
+            serverSocket => close[IO](serverSocket) >> IO(println("server finished"))
+          }
+ 
   }
 
 }
